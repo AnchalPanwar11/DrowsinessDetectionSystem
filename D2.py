@@ -7,12 +7,26 @@ Update PREDICTOR_PATH to your dlib 68-landmarks file.
 
 import time, math
 import cv2
+import csv
 import dlib
 import imutils
 import numpy as np
 import mediapipe as mp
 from collections import deque
 from imutils import face_utils
+
+from tensorflow.keras.models import load_model
+import joblib
+
+risk_model = joblib.load("risk_model.pkl")
+
+model = load_model("drowsiness_model.h5")
+
+def preprocess_face(face):
+    face = cv2.resize(face, (224, 224))
+    face = face / 255.0
+    face = np.reshape(face, (1, 224, 224, 3))
+    return face
 
 # -------------------- CONFIG (tune these) --------------------
 PREDICTOR_PATH = "./dlib_shape_predictor/shape_predictor_68_face_landmarks.dat"
@@ -28,8 +42,8 @@ MOUTH_AR_THRESH = 0.79
 EYE_AR_CONSEC_FRAMES = 3
 
 # Head-tilt
-HEAD_TILT_THRESH = 20            # degrees
-HEAD_TILT_CONSEC_FRAMES = 10
+HEAD_TILT_THRESH = 15
+HEAD_TILT_CONSEC_FRAMES = 5
 
 # Wheel/lean-forward params
 WHEEL_DIAMETER_M = 0.38
@@ -220,6 +234,10 @@ alert_label = ""
 eye_counter = 0
 head_counter = 0
 
+eye_state = False
+mouth_state = False
+head_state = False
+
 image_points = np.zeros((6,2), dtype="double")
 (lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
 (rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
@@ -269,6 +287,8 @@ cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
 # -------------------- MAIN LOOP --------------------
+file = open("driver_data.csv", mode="a", newline="")
+writer = csv.writer(file)
 while True:
     t0 = time.time()
     ret, frame = cap.read()
@@ -321,7 +341,37 @@ while True:
     # process dlib-detected faces for EAR/MAR/head-pose
     for rect in rects:
         (bX, bY, bW, bH) = face_utils.rect_to_bb(rect)
+        face = frame[bY:bY+bH, bX:bX+bW]
         face_box_color = (0,255,0)
+
+        try:
+            face_input = preprocess_face(face)
+            prediction = model.predict(face_input, verbose=0)[0][0]
+
+            # Convert to binary state
+            # Smooth ML prediction
+            if 'ml_buffer' not in globals():
+                ml_buffer = deque(maxlen=10)
+
+            ml_buffer.append(prediction)
+            ml_avg = np.mean(ml_buffer)
+
+            # Better thresholds
+            if ml_avg > 0.80:
+                ml_level = "HIGH"
+            elif ml_avg > 0.65:
+                ml_level = "MEDIUM"
+            else:
+                ml_level = "LOW"
+
+        except:
+            ml_drowsy = False
+
+        # Show result
+        cv2.putText(frame, f"ML: {prediction:.2f}", (bX, bY-30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+        # ===== ML PART END =====
 
         shape = predictor(gray, rect)
         shape = face_utils.shape_to_np(shape)
@@ -353,6 +403,11 @@ while True:
         cv2.putText(frame, f"MAR: {mar:.2f}", (int(w*0.64), 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
         if mar > MOUTH_AR_THRESH:
             cv2.putText(frame, "Yawning!", (int(w*0.78), 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
+        # ---- update persistent states (DO NOT MOVE) ----
+        eye_state = (eye_counter >= EYE_AR_CONSEC_FRAMES * 2)   # ignores blinking
+        mouth_state = (mar > MOUTH_AR_THRESH)
+        head_state = (head_counter >= HEAD_TILT_CONSEC_FRAMES)
+
 
         # head-pose points
         key_indices = [33, 8, 36, 45, 48, 54]
@@ -439,8 +494,86 @@ while True:
     if fused_distance is not None:
         cv2.putText(frame, f"WheelDist: {fused_distance:.2f} m", (10, h-30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
 
+
+        # ================= DRIVER WARNING LEVEL (HUMAN LOGIC) =================
+
+    # Persistent counters (init once)
+    if 'warn_drowsy' not in globals():
+        warn_drowsy = 0
+        warn_head = 0
+        warn_lean = 0
+        stable_level = "LOW"
+
+    PERSIST = 4  # smoothness (frames)
+
+    # ---- Individual condition activity (use YOUR variables) ----
+    drowsy_active = (
+    eye_state or 
+    mouth_state or 
+    (ml_level == "HIGH")
+    )
+    head_active = head_state
+    lean_active = lean_alert_active
+
+
+    # ---- Persistence smoothing ----
+    warn_drowsy = warn_drowsy + 1 if drowsy_active else max(0, warn_drowsy - 1)
+    warn_head = warn_head + 1 if head_active else max(0, warn_head - 1)
+    warn_lean = warn_lean + 1 if lean_active else max(0, warn_lean - 1)
+
+    active_count = sum([
+    warn_drowsy > PERSIST,
+    warn_head > PERSIST,
+    warn_lean > PERSIST
+    ])
+
+    # ---- Final warning level ----
+    # ---- Final warning level ----
+    # ---- Final warning level ----
+    # ---------------- FINAL DECISION ENGINE ----------------
+    # ---------------- AI DECISION ENGINE ----------------
+
+    if fused_distance is not None and head_roll is not None:
+        
+        input_data = [[prediction, abs(head_roll), fused_distance]]
+        
+        # ---- smooth predictions ----
+        if 'pred_buffer' not in globals():
+            from collections import deque
+            pred_buffer = deque(maxlen=10)
+
+        pred = risk_model.predict(input_data)[0]
+        pred_buffer.append(pred)
+
+        # majority voting
+        stable_level = max(set(pred_buffer), key=pred_buffer.count)
+
+        if stable_level == "HIGH":
+            level_color = (0,0,255)
+        elif stable_level == "MED":
+            level_color = (0,255,255)
+        else:
+            level_color = (0,255,0)
+
+    # ---- UI (TOP RIGHT – EMPTY ZONE) ----
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (w-300, 20), (w-20, 110), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    cv2.putText(frame, "DRIVER STATUS", (w-290, 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+
+    cv2.putText(frame, stable_level, (w-290, 95),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.3, level_color, 4)
+
+    # ======================================================================
+
+
     # footer and show (fullscreen window)
+    
     cv2.putText(frame, "Press 'q' or ESC to quit", (w-350, h-30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220,220,220), 2)
+    if fused_distance is not None and head_roll is not None:
+        writer.writerow([prediction, abs(head_roll), fused_distance])
     cv2.imshow(win_name, frame)
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q') or key == 27:
@@ -450,3 +583,4 @@ while True:
 cap.release()
 cv2.destroyAllWindows()
 face_mesh.close()
+file.close()
